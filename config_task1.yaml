@@ -1,0 +1,116 @@
+# Task 1: 61-class Agricultural Disease Classification Baseline
+# "Start simple. Make it work. Then optimize."
+
+# Model configuration
+model:
+  name: "resnet50"  # Simple, stable, proven
+  pretrained: true
+  num_classes: 61
+  dropout: 0.3
+
+# Data configuration
+data:
+  train_dir: "data/cleaned/train"
+  val_dir: "data/cleaned/val"
+  test_dir: "data/raw/AgriculturalDisease_validationset"
+
+  image_size: 224
+  batch_size: 64
+  num_workers: 4
+  pin_memory: true
+
+  # Data augmentation (start conservative)
+  augmentation:
+    train:
+      - resize: 256
+      - random_crop: 224
+      - horizontal_flip: 0.5
+      - color_jitter:
+          brightness: 0.2
+          contrast: 0.2
+          saturation: 0.2
+          hue: 0.1
+      - normalize:
+          mean: [0.485, 0.456, 0.406]
+          std: [0.229, 0.224, 0.225]
+
+    val:
+      - resize: 224
+      - center_crop: 224
+      - normalize:
+          mean: [0.485, 0.456, 0.406]
+          std: [0.229, 0.224, 0.225]
+
+# Training configuration
+training:
+  epochs: 50
+
+  # Optimizer (AdamW - no SGD hassle)
+  optimizer:
+    type: "adamw"
+    lr: 1e-4
+    weight_decay: 1e-4
+    betas: [0.9, 0.999]
+
+  # Learning rate scheduler
+  scheduler:
+    type: "cosine"
+    T_max: 50
+    eta_min: 1e-6
+
+  # Loss function
+  loss:
+    type: "cross_entropy"
+    label_smoothing: 0.1
+    # Class weights will be computed from dataset
+
+  # Regularization
+  gradient_clip: 1.0
+  use_amp: true  # Mixed precision training
+
+  # Checkpointing
+  save_dir: "checkpoints/task1_baseline"
+  save_freq: 5  # Save every 5 epochs
+  save_best: true
+
+  # Logging
+  log_interval: 10  # Log every 10 batches
+  tensorboard: true
+  tensorboard_dir: "results/tensorboard/task1"
+
+# Evaluation
+evaluation:
+  metrics:
+    - accuracy
+    - top5_accuracy
+    - precision
+    - recall
+    - f1_score
+
+  # Confusion matrix for error analysis
+  save_confusion_matrix: true
+
+  # Per-class metrics
+  per_class_metrics: true
+
+# Hardware
+device: "cuda"  # Will auto-fallback to CPU if no GPU
+seed: 42
+
+# Stage-based training (optional, for better convergence)
+# Uncomment to use two-stage training
+# stages:
+#   - name: "freeze_backbone"
+#     epochs: 10
+#     freeze_backbone: true
+#     lr: 1e-3
+#
+#   - name: "finetune_all"
+#     epochs: 40
+#     freeze_backbone: false
+#     lr: 1e-4
+
+# Notes:
+# - Start with this baseline. Don't add tricks until you see actual problems.
+# - If accuracy < 85%, check data quality first, not model architecture.
+# - "Premature optimization is the root of all evil." - Knuth
