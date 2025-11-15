@@ -119,13 +119,13 @@ def parse_args():
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=64,
+        default=32,
         help="Batch size",
     )
     parser.add_argument(
         "--lr",
         type=float,
-        default=1e-4,
+        default=5e-4,
         help="Learning rate",
     )
     parser.add_argument(
@@ -395,15 +395,29 @@ def main():
         )
     print(f"Optimizer: {args.optimizer}")
 
-    # Create scheduler
+    # Create scheduler with warmup
+    # Good taste: warmup prevents pretrained model from destroying learned features
     scheduler = None
     if args.scheduler == "cosine":
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        # Warmup for first 5 epochs, then cosine decay
+        warmup_epochs = 5
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
             optimizer,
-            T_max=args.epochs,
+            start_factor=0.02,  # Start from lr * 0.02 = 1e-5
+            end_factor=1.0,  # Reach full lr = 5e-4
+            total_iters=warmup_epochs,
+        )
+        cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=args.epochs - warmup_epochs,  # Decay after warmup
             eta_min=1e-6,
         )
-        print(f"Scheduler: Cosine Annealing")
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[warmup_epochs],
+        )
+        print(f"Scheduler: Warmup ({warmup_epochs} epochs) + Cosine Annealing")
     elif args.scheduler == "step":
         scheduler = torch.optim.lr_scheduler.StepLR(
             optimizer,
