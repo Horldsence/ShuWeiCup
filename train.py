@@ -349,7 +349,7 @@ def main():
             print("\nCompiling model with torch.compile...")
             if device.type == "cuda":
                 # CUDA: use max-autotune for best performance
-                model = torch.compile(model, mode="max-autotune")
+                model = torch.compile(model, mode="reduce-overhead")
             else:
                 # CPU: use default mode
                 model = torch.compile(model)

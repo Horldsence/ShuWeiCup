@@ -3,7 +3,7 @@
 
 # Model configuration
 model:
-  name: "resnet50"  # Simple, stable, proven
+  name: "resnet50" # Simple, stable, proven
   pretrained: true
   num_classes: 61
   dropout: 0.3
@@ -15,7 +15,7 @@ data:
   test_dir: "data/raw/AgriculturalDisease_validationset"
 
   image_size: 224
-  batch_size: 64
+  batch_size: 32
   num_workers: 4
   pin_memory: true
 
@@ -48,13 +48,14 @@ training:
   # Optimizer (AdamW - no SGD hassle)
   optimizer:
     type: "adamw"
-    lr: 1e-4
+    lr: 5e-4
     weight_decay: 1e-4
     betas: [0.9, 0.999]
 
-  # Learning rate scheduler
+  # Learning rate scheduler with warmup
   scheduler:
     type: "cosine"
+    warmup_epochs: 5
     T_max: 50
     eta_min: 1e-6
 
@@ -66,15 +67,15 @@ training:
 
   # Regularization
   gradient_clip: 1.0
-  use_amp: true  # Mixed precision training
+  use_amp: true # Mixed precision training
 
   # Checkpointing
   save_dir: "checkpoints/task1_baseline"
-  save_freq: 5  # Save every 5 epochs
+  save_freq: 5 # Save every 5 epochs
   save_best: true
 
   # Logging
-  log_interval: 10  # Log every 10 batches
+  log_interval: 10 # Log every 10 batches
   tensorboard: true
   tensorboard_dir: "results/tensorboard/task1"
 
@@ -94,9 +95,8 @@ evaluation:
   per_class_metrics: true
 
 # Hardware
-device: "cuda"  # Will auto-fallback to CPU if no GPU
+device: "cuda" # Will auto-fallback to CPU if no GPU
 seed: 42
-
 # Stage-based training (optional, for better convergence)
 # Uncomment to use two-stage training
 # stages:

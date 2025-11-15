@@ -17,6 +17,10 @@ import time
 from pathlib import Path
 from typing import Dict, Optional
 
+import matplotlib
+
+matplotlib.use("Agg")  # Non-interactive backend for server
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 from torch.amp import GradScaler, autocast
@@ -96,6 +100,16 @@ class Trainer:
         self.epoch = 0
         self.global_step = 0
         self.best_val_acc = 0.0
+
+        # Training history for plotting
+        self.history = {
+            "epoch": [],
+            "train_loss": [],
+            "train_acc": [],
+            "val_loss": [],
+            "val_acc": [],
+            "learning_rate": [],
+        }
 
         print(f"Trainer initialized:")
         print(f"  Device: {device}")
@@ -320,6 +334,88 @@ class Trainer:
 
         return metrics
 
+    def plot_training_curves(self):
+        """
+        Plot training curves and save to disk.
+
+        Good taste: one plot shows everything you need.
+        No fancy dashboard - just clear, simple visualization.
+        """
+        if len(self.history["epoch"]) == 0:
+            return
+
+        # Create figure with 3 subplots
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+        fig.suptitle("Training Progress", fontsize=16, fontweight="bold")
+
+        epochs = self.history["epoch"]
+
+        # Plot 1: Loss curves
+        ax1 = axes[0]
+        ax1.plot(epochs, self.history["train_loss"], "b-", label="Train Loss", linewidth=2)
+        ax1.plot(epochs, self.history["val_loss"], "r-", label="Val Loss", linewidth=2)
+        ax1.set_xlabel("Epoch", fontsize=12)
+        ax1.set_ylabel("Loss", fontsize=12)
+        ax1.set_title("Loss Curves", fontsize=14, fontweight="bold")
+        ax1.legend(fontsize=10)
+        ax1.grid(True, alpha=0.3)
+
+        # Plot 2: Accuracy curves
+        ax2 = axes[1]
+        ax2.plot(epochs, self.history["train_acc"], "b-", label="Train Acc", linewidth=2)
+        ax2.plot(epochs, self.history["val_acc"], "r-", label="Val Acc", linewidth=2)
+        ax2.set_xlabel("Epoch", fontsize=12)
+        ax2.set_ylabel("Accuracy (%)", fontsize=12)
+        ax2.set_title("Accuracy Curves", fontsize=14, fontweight="bold")
+        ax2.legend(fontsize=10)
+        ax2.grid(True, alpha=0.3)
+
+        # Add best accuracy marker
+        best_idx = self.history["val_acc"].index(max(self.history["val_acc"]))
+        best_epoch = self.history["epoch"][best_idx]
+        best_acc = self.history["val_acc"][best_idx]
+        ax2.plot(
+            best_epoch,
+            best_acc,
+            "g*",
+            markersize=15,
+            label=f"Best: {best_acc:.2f}% @ Epoch {best_epoch}",
+        )
+        ax2.legend(fontsize=10)
+
+        # Plot 3: Learning rate schedule
+        ax3 = axes[2]
+        ax3.plot(epochs, self.history["learning_rate"], "g-", linewidth=2)
+        ax3.set_xlabel("Epoch", fontsize=12)
+        ax3.set_ylabel("Learning Rate", fontsize=12)
+        ax3.set_title("Learning Rate Schedule", fontsize=14, fontweight="bold")
+        ax3.set_yscale("log")  # Log scale for LR
+        ax3.grid(True, alpha=0.3)
+
+        # Add text box with current stats
+        current_stats = (
+            f"Current Epoch: {self.epoch}\n"
+            f"Best Val Acc: {self.best_val_acc:.2f}%\n"
+            f"Train Acc: {self.history['train_acc'][-1]:.2f}%\n"
+            f"Val Acc: {self.history['val_acc'][-1]:.2f}%"
+        )
+        fig.text(
+            0.02,
+            0.02,
+            current_stats,
+            fontsize=10,
+            bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
+        )
+
+        plt.tight_layout(rect=[0, 0.03, 1, 0.96])
+
+        # Save figure
+        plot_path = self.save_dir / "training_curves.png"
+        plt.savefig(plot_path, dpi=100, bbox_inches="tight")
+        plt.close()
+
+        print(f"  📊 Training curves saved to {plot_path}")
+
     def train(self, num_epochs: int, save_freq: int = 5):
         """
         Full training loop.
@@ -342,12 +438,23 @@ class Trainer:
             # Validate
             val_metrics = self.validate()
 
+            # Get current learning rate before stepping
+            current_lr = self.optimizer.param_groups[0]["lr"]
+
             # Step scheduler
             if self.scheduler is not None:
                 self.scheduler.step()
 
+            # Update history
+            self.history["epoch"].append(epoch)
+            self.history["train_loss"].append(train_metrics["loss"])
+            self.history["train_acc"].append(train_metrics["accuracy"])
+            self.history["val_loss"].append(val_metrics["loss"])
+            self.history["val_acc"].append(val_metrics["accuracy"])
+            self.history["learning_rate"].append(current_lr)
+
             # Log metrics
-            print(f"\nEpoch {epoch}/{num_epochs}:")
+            print(f"\nEpoch {epoch}/{num_epochs} (LR: {current_lr:.6f}):")
             print(
                 f"  Train Loss: {train_metrics['loss']:.4f} | Acc: {train_metrics['accuracy']:.2f}%"
             )
@@ -362,6 +469,7 @@ class Trainer:
             if self.writer:
                 self.writer.add_scalar("val/loss", val_metrics["loss"], epoch)
                 self.writer.add_scalar("val/accuracy", val_metrics["accuracy"], epoch)
+                self.writer.add_scalar("train/epoch_lr", current_lr, epoch)
 
                 if self.multi_task:
                     for key in ["label_61", "crop", "disease", "severity"]:
@@ -376,6 +484,9 @@ class Trainer:
 
             if (epoch + 1) % save_freq == 0:
                 self.save_checkpoint(f"epoch_{epoch + 1}.pth", val_metrics)
+
+            # Plot training curves after each epoch
+            self.plot_training_curves()
 
         # Training complete
         elapsed_time = time.time() - start_time
@@ -395,6 +506,7 @@ class Trainer:
             "optimizer_state_dict": self.optimizer.state_dict(),
             "best_val_acc": self.best_val_acc,
             "metrics": metrics,
+            "history": self.history,
         }
 
         if self.scheduler is not None:
@@ -412,6 +524,11 @@ class Trainer:
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         self.epoch = checkpoint["epoch"]
         self.best_val_acc = checkpoint["best_val_acc"]
+
+        # Restore training history if available
+        if "history" in checkpoint:
+            self.history = checkpoint["history"]
+            print(f"  Training history restored ({len(self.history['epoch'])} epochs)")
 
         if self.scheduler is not None and "scheduler_state_dict" in checkpoint:
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
