@@ -16,3 +16,4 @@ wheels/
 data
 checkpoints
 demo_plots
+evaluation_samples
