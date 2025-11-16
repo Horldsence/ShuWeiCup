@@ -111,6 +111,11 @@ class Trainer:
             "learning_rate": [],
         }
 
+        # Multi-task attributes (set externally if needed)
+        self.primary_task = "label_61"  # Default primary task for accuracy
+        self.dynamic_task_weights = False  # Enable dynamic task weight updating
+        self.task_weight_ema = 0.6  # EMA smoothing factor for dynamic weights
+
         print(f"Trainer initialized:")
         print(f"  Device: {device}")
         print(f"  AMP: {self.use_amp}")
