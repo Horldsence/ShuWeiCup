@@ -621,7 +621,6 @@ def validate(
 # -----------------------------
 # 5. Grad-CAM 可视化
 # -----------------------------
-@torch.no_grad()
 def run_gradcam(
     model: SeverityClassifier,
     loader: DataLoader,
@@ -655,7 +654,8 @@ def run_gradcam(
             img_np = (img_tensor * std + mean).clamp(0, 1).permute(1, 2, 0).numpy()
 
             # 生成 CAM
-            grayscale_cam = cam(input_tensor=images[i].unsqueeze(0))[0]
+            with torch.enable_grad():
+                grayscale_cam = cam(input_tensor=images[i].unsqueeze(0))[0]
             if callable(show_cam_on_image):
                 visualization = show_cam_on_image(
                     img_np, grayscale_cam, use_rgb=True, image_weight=0.55
