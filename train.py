@@ -103,18 +103,18 @@ def apply_mixup_cutmix(
     elif use_cutmix:
         lam = np.random.beta(cutmix_alpha, cutmix_alpha)
         # Generate random bounding box
-        H, W = images.size(2), images.size(3)
+        h, w = images.size(2), images.size(3)
         cut_rat = math.sqrt(1.0 - lam)
-        cut_h = int(H * cut_rat)
-        cut_w = int(W * cut_rat)
-        cy = np.random.randint(0, H)
-        cx = np.random.randint(0, W)
-        y1 = np.clip(cy - cut_h // 2, 0, H)
-        y2 = np.clip(cy + cut_h // 2, 0, H)
-        x1 = np.clip(cx - cut_w // 2, 0, W)
-        x2 = np.clip(cx + cut_w // 2, 0, W)
+        cut_h = int(h * cut_rat)
+        cut_w = int(w * cut_rat)
+        cy = np.random.randint(0, h)
+        cx = np.random.randint(0, w)
+        y1 = np.clip(cy - cut_h // 2, 0, h)
+        y2 = np.clip(cy + cut_h // 2, 0, h)
+        x1 = np.clip(cx - cut_w // 2, 0, w)
+        x2 = np.clip(cx + cut_w // 2, 0, w)
         images[:, :, y1:y2, x1:x2] = images[index, :, y1:y2, x1:x2]
-        lam = 1.0 - ((x2 - x1) * (y2 - y1) / (H * W))
+        lam = 1.0 - ((x2 - x1) * (y2 - y1) / (h * w))
         return images, targets, targets[index], lam
     else:
         return images, targets, targets, lam
@@ -159,9 +159,9 @@ def custom_train_loop(
                 images = images.to(device)
                 if device.type == "cuda":
                     images = images.to(memory_format=torch.channels_last)
-                targets = labels["label_61"] if multi_task else labels["label_61"]
-                targets = targets.to(device)
-                outputs = model(images) if not multi_task else model(images)["label_61"]
+                targets = labels["label_61"].to(device)
+                outputs_raw = model(images)
+                outputs = outputs_raw["label_61"] if isinstance(outputs_raw, dict) else outputs_raw
                 loss = criterion(outputs, targets)
                 total_loss += loss.item() * images.size(0)
                 preds = outputs.argmax(1)
@@ -181,15 +181,14 @@ def custom_train_loop(
             images = images.to(device)
             if device.type == "cuda":
                 images = images.to(memory_format=torch.channels_last)
-            targets = labels["label_61"] if multi_task else labels["label_61"]
-            targets = targets.to(device)
+            targets = labels["label_61"].to(device)
             images_aug, ta, tb, lam = apply_mixup_cutmix(
                 images, targets, mixup_alpha, cutmix_alpha, mixup_prob, cutmix_prob
             )
             optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=(use_amp and device.type == "cuda")):
                 outputs_all = model(images_aug)
-                outputs = outputs_all if not multi_task else outputs_all["label_61"]
+                outputs = outputs_all["label_61"] if isinstance(outputs_all, dict) else outputs_all
                 loss = lam * criterion(outputs, ta) + (1 - lam) * criterion(outputs, tb)
             scaler.scale(loss).backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -228,6 +227,10 @@ def custom_train_loop(
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "best_val_acc": best_acc,
+                    "train_loss": train_loss,
+                    "train_acc": train_acc,
+                    "val_loss": val_loss,
+                    "val_acc": val_acc,
                 },
                 Path(save_dir) / "best_custom.pth",
             )
@@ -600,7 +603,7 @@ def main():
         print("CUDA device detected - will use channels_last on batch tensors")
 
     # torch.compile removed: keep raw_model for all training to reduce complexity
-    compiled_model = raw_model
+    # Removed compiled_model (torch.compile disabled); using raw_model directly
 
     # Create loss function
     print("\nCreating loss function...")
