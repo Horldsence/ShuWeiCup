@@ -67,7 +67,7 @@ class AgriDiseaseDataset(Dataset):
         Get a sample.
 
         Returns:
-            image: [3, H, W] tensor
+            image: [3, H, W] tensor (torch.Tensor)
             labels: Dict with keys 'label_61', 'crop', 'disease', 'severity'
 
         Good taste: return dict instead of tuple for extensibility.
@@ -86,10 +86,18 @@ class AgriDiseaseDataset(Dataset):
 
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-        # Apply transforms
+        # Apply transforms (if provided)
         if self.transform is not None:
             transformed = self.transform(image=image)
             image = transformed["image"]
+        else:
+            # Fallback: convert numpy array to torch tensor [3, H, W], normalize to 0..1
+            # Avoid special cases later in the pipeline.
+            image = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
+
+        # Ensure tensor type (ToTensorV2 already returns torch.Tensor)
+        if not torch.is_tensor(image):
+            image = torch.from_numpy(image).permute(2, 0, 1).float()
 
         # Prepare labels
         if self.return_multitask:
@@ -116,19 +124,15 @@ def get_train_transform(image_size: int = 224) -> A.Compose:
     """
     return A.Compose(
         [
-            # Replace invalid RandomResizedCrop (albumentations expects size tuple) with Resize + RandomCrop
             A.Resize(image_size, image_size),
-            # Orientation variance (fields can flip)
             A.HorizontalFlip(p=0.5),
             A.VerticalFlip(p=0.2),
-            # Mild geometric perturbation (smaller than before)
             A.ShiftScaleRotate(
                 shift_limit=0.05,
                 scale_limit=0.10,
                 rotate_limit=25,
                 p=0.5,
             ),
-            # Color jitter (reduced strength to avoid masking chlorosis patterns)
             A.ColorJitter(
                 brightness=0.2,
                 contrast=0.2,
@@ -136,11 +140,47 @@ def get_train_transform(image_size: int = 224) -> A.Compose:
                 hue=0.08,
                 p=0.7,
             ),
-            # Light blur/noise (avoid motion blur; keep Gaussian + slight noise)
             A.GaussianBlur(blur_limit=3, p=0.3),
-            # Reduced coarse dropout (fewer holes; avoid erasing all lesions)
-            # Removed CoarseDropout (version incompatibility) to preserve lesion texture
-            # Normalize
+            A.Normalize(
+                mean=(0.485, 0.456, 0.406),
+                std=(0.229, 0.224, 0.225),
+            ),
+            ToTensorV2(),
+        ]
+    )
+
+
+def get_progressive_train_transform(image_size: int = 256) -> A.Compose:
+    """
+    Progressive fine-tune augmentation for higher resolution phase.
+
+    Uses RandomResizedCrop to add slight scale/ratio variance while preserving lesion detail.
+    Parameters tuned conservatively to avoid destroying small spot patterns.
+    """
+    return A.Compose(
+        [
+            A.RandomResizedCrop(
+                size=(image_size, image_size),
+                scale=(0.85, 1.0),
+                ratio=(0.9, 1.1),
+                p=1.0,
+            ),
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.15),
+            A.ShiftScaleRotate(
+                shift_limit=0.03,
+                scale_limit=0.08,
+                rotate_limit=20,
+                p=0.4,
+            ),
+            A.ColorJitter(
+                brightness=0.15,
+                contrast=0.15,
+                saturation=0.15,
+                hue=0.05,
+                p=0.6,
+            ),
+            A.GaussianBlur(blur_limit=3, p=0.15),
             A.Normalize(
                 mean=(0.485, 0.456, 0.406),
                 std=(0.229, 0.224, 0.225),

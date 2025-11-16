@@ -29,9 +29,34 @@ from torch.utils.data import DataLoader
 
 # Import our modules
 from dataset import AgriDiseaseDataset, collate_fn, get_train_transform, get_val_transform
-from losses import create_loss_function
+from losses import FocalLoss, create_loss_function
 from models import create_model
 from trainer import Trainer
+
+
+# Cosine / Center loss moved to module scope (clean activation flags)
+class CosineClassifier(nn.Module):
+    def __init__(self, in_features: int, num_classes: int, scale: float = 30.0):
+        super().__init__()
+        self.scale = scale
+        self.weight = nn.Parameter(torch.randn(num_classes, in_features))
+        nn.init.xavier_uniform_(self.weight)
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        f = torch.nn.functional.normalize(features, dim=1)
+        w = torch.nn.functional.normalize(self.weight, dim=1)
+        return self.scale * torch.matmul(f, w.t())
+
+
+class CenterLoss(nn.Module):
+    def __init__(self, num_classes: int, feat_dim: int):
+        super().__init__()
+        self.centers = nn.Parameter(torch.randn(num_classes, feat_dim))
+        nn.init.xavier_uniform_(self.centers)
+
+    def forward(self, features: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        centers_batch = self.centers[targets]
+        return ((features - centers_batch) ** 2).sum(dim=1).mean()
 
 
 def build_weighted_sampler(metadata_df, label_col: str = "label_61", power: float = 0.5):
@@ -137,24 +162,81 @@ def custom_train_loop(
     cutmix_prob: float,
     save_dir: str,
     ema: Optional[ModelEMA] = None,
+    # Phase scheduling params
+    stage2_epoch: int = 10,
+    stage3_epoch: int = 20,
+    smoothing_decay_epoch1: int = 12,
+    smoothing_decay_epoch2: int = 18,
+    disable_sampler_epoch: int = 15,
+    lr_restart_epoch: int = 25,
+    tail_focal_epoch: int = 18,
+    progressive_resize_epoch: int = 30,
+    progressive_image_size: int = 256,
+    final_clean_epoch: int = 40,
+    # Dynamic regularization decay params
+    mixup_decay_epoch1: int = 10,
+    mixup_decay_epoch2: int = 12,
+    mixup_disable_epoch: int = 15,
+    cutmix_disable_epoch: int = 10,
+    # Margin sharpening phase
+    use_cosine_classifier: bool = False,
+    use_center_loss: bool = False,
+    center_loss_weight: float = 0.01,
+    center_update_epoch: int = 35,
+    model_type: str = "baseline",
 ):
     """
     Minimal custom training loop supporting sampler, Mixup/CutMix, EMA.
     Prints epoch metrics similar to Trainer.
     """
-    # Type assertions to satisfy static analyzer
+    # Type assertions
     assert isinstance(model, nn.Module), "model must be nn.Module"
     assert scheduler is None or hasattr(scheduler, "step"), (
         "scheduler must implement step() or be None"
     )
     scaler = torch.cuda.amp.GradScaler(enabled=(use_amp and device.type == "cuda"))
 
+    # Precompute tail class set (bottom 25% frequency) for focal application
+    label_col_values = train_loader.dataset.metadata["label_61"].tolist()
+    from collections import Counter
+
+    freq_counter = Counter(label_col_values)
+    sorted_ids = sorted(freq_counter.keys(), key=lambda k: freq_counter[k])
+    tail_cut = max(1, int(len(sorted_ids) * 0.25))
+    tail_set = set(sorted_ids[:tail_cut])
+
+    # Optional focal loss object (will be triggered later)
+    focal_loss_obj = FocalLoss(alpha=None, gamma=1.5) if tail_focal_epoch < epochs else None
+
+    def adaptive_loss(outputs_logits: torch.Tensor, targets_tensor: torch.Tensor, epoch_idx: int):
+        # Epoch-based switching: focal only for tail samples after tail_focal_epoch
+        if focal_loss_obj is not None and epoch_idx >= tail_focal_epoch:
+            tail_mask = torch.tensor(
+                [t.item() in tail_set for t in targets_tensor], device=targets_tensor.device
+            )
+            if tail_mask.any():
+                tail_indices = tail_mask.nonzero(as_tuple=True)[0]
+                non_tail_indices = (~tail_mask).nonzero(as_tuple=True)[0]
+                tail_loss = focal_loss_obj(
+                    outputs_logits[tail_indices], targets_tensor[tail_indices]
+                )
+                if non_tail_indices.numel() > 0:
+                    ce_loss = criterion(
+                        outputs_logits[non_tail_indices], targets_tensor[non_tail_indices]
+                    )
+                    return tail_loss + ce_loss
+                return tail_loss
+        return criterion(outputs_logits, targets_tensor)
+
     def run_val(current_epoch: int):
         model.eval()
         correct = 0
         total = 0
         total_loss = 0.0
+        per_class_total = {}
+        per_class_correct = {}
         with torch.inference_mode():
+            predicted_total = {}
             for images, labels in val_loader:
                 images = images.to(device)
                 if device.type == "cuda":
@@ -167,17 +249,93 @@ def custom_train_loop(
                 preds = outputs.argmax(1)
                 correct += preds.eq(targets).sum().item()
                 total += images.size(0)
+                # Per-class stats
+                for t, p in zip(targets.tolist(), preds.tolist()):
+                    per_class_total[t] = per_class_total.get(t, 0) + 1
+                    predicted_total[p] = predicted_total.get(p, 0) + 1
+                    if p == t:
+                        per_class_correct[t] = per_class_correct.get(t, 0) + 1
         acc = 100.0 * correct / total
-        print(f"  [Val] Epoch {current_epoch} | Loss {total_loss / total:.4f} | Acc {acc:.2f}%")
-        return acc, total_loss / total
+        # Tail mean acc
+        tail_acc_vals = []
+        for cid in tail_set:
+            if per_class_total.get(cid, 0) > 0:
+                tail_acc_vals.append(per_class_correct.get(cid, 0) / per_class_total[cid])
+        tail_mean_acc = (sum(tail_acc_vals) / len(tail_acc_vals) * 100.0) if tail_acc_vals else 0.0
+        # Macro-F1 (one-vs-rest approximation from counts)
+        f1_vals = []
+        for cid in per_class_total.keys():
+            tp = per_class_correct.get(cid, 0)
+            support = per_class_total.get(cid, 0)
+            pred_cnt = predicted_total.get(cid, 0)
+            fp = pred_cnt - tp
+            fn = support - tp
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            f1 = (
+                (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+            )
+            f1_vals.append(f1)
+        macro_f1 = sum(f1_vals) / len(f1_vals) if f1_vals else 0.0
+        print(
+            f"  [Val] Epoch {current_epoch} | Loss {total_loss / total:.4f} | Acc {acc:.2f}% | TailAcc {tail_mean_acc:.2f}% | MacroF1 {macro_f1:.3f}"
+        )
+        return acc, total_loss / total, tail_mean_acc, macro_f1
 
     best_acc = 0.0
     for epoch in range(epochs):
+        # Phase transitions
+        if epoch == stage2_epoch:
+            # Slight LR bump for partial fine-tune
+            for pg in optimizer.param_groups:
+                pg["lr"] = pg["lr"] * 1.2
+            print(f"[Phase] Stage2 start @ epoch {epoch} | LR bump applied")
+        if epoch == stage3_epoch:
+            for p in model.parameters():
+                p.requires_grad = True
+            print(f"[Phase] Stage3 start @ epoch {epoch} | Backbone unfrozen")
+        if epoch == smoothing_decay_epoch1 and hasattr(criterion, "label_smoothing"):
+            criterion.label_smoothing = 0.02
+            print(f"[Phase] Smoothing -> 0.02 @ epoch {epoch}")
+        if epoch == smoothing_decay_epoch2 and hasattr(criterion, "label_smoothing"):
+            criterion.label_smoothing = 0.0
+            print(f"[Phase] Smoothing -> 0.00 @ epoch {epoch}")
+        if epoch == lr_restart_epoch:
+            for pg in optimizer.param_groups:
+                pg["lr"] = pg["lr"] * 0.4
+            print(f"[Phase] LR restart @ epoch {epoch}")
+        if epoch == progressive_resize_epoch:
+            from dataset import get_train_transform
+
+            new_transform = get_train_transform(progressive_image_size)
+            train_loader.dataset.transform = new_transform
+            print(f"[Phase] Progressive resize -> {progressive_image_size} @ epoch {epoch}")
+        if epoch == final_clean_epoch:
+            from dataset import get_light_train_transform
+
+            train_loader.dataset.transform = get_light_train_transform(progressive_image_size)
+            print(f"[Phase] Final clean augmentation @ epoch {epoch}")
+        if (
+            epoch == disable_sampler_epoch
+            and hasattr(train_loader, "sampler")
+            and isinstance(train_loader.sampler, torch.utils.data.WeightedRandomSampler)
+        ):
+            print(f"[Phase] Disabling sampler @ epoch {epoch} (switch to natural distribution)")
+
         model.train()
         total_loss = 0.0
         correct = 0
         total = 0
         for images, labels in train_loader:
+            # Dynamic Mixup/CutMix decay schedule (epochs passed as function params)
+            if epoch == mixup_decay_epoch1 and mixup_alpha > 0:
+                mixup_alpha = max(mixup_alpha * 0.5, 0.2)
+            if epoch == mixup_decay_epoch2 and mixup_alpha > 0:
+                mixup_alpha = max(mixup_alpha * 0.5, 0.1)
+            if epoch == mixup_disable_epoch and mixup_alpha > 0:
+                mixup_alpha = 0.0
+            if epoch == cutmix_disable_epoch and cutmix_alpha > 0:
+                cutmix_alpha = 0.0
             images = images.to(device)
             if device.type == "cuda":
                 images = images.to(memory_format=torch.channels_last)
@@ -189,7 +347,10 @@ def custom_train_loop(
             with torch.cuda.amp.autocast(enabled=(use_amp and device.type == "cuda")):
                 outputs_all = model(images_aug)
                 outputs = outputs_all["label_61"] if isinstance(outputs_all, dict) else outputs_all
-                loss = lam * criterion(outputs, ta) + (1 - lam) * criterion(outputs, tb)
+                primary_loss = lam * adaptive_loss(outputs, ta, epoch) + (1 - lam) * adaptive_loss(
+                    outputs, tb, epoch
+                )
+                loss = primary_loss
             scaler.scale(loss).backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
@@ -208,17 +369,36 @@ def custom_train_loop(
         print(
             f"Epoch {epoch}/{epochs} | Train Loss {train_loss:.4f} | Train Acc {train_acc:.2f}% | LR {optimizer.param_groups[0]['lr']:.6f}"
         )
-        # Validation with EMA shadow if enabled
+        # Validation (EMA shadow if enabled)
         if ema:
             saved = {n: p.data.clone() for n, p in model.named_parameters() if p.requires_grad}
             ema.apply_to(model)
-            val_acc, val_loss = run_val(epoch)
-            # Restore params
+            val_acc, val_loss, tail_mean_acc, macro_f1 = run_val(epoch)
             for n, p in model.named_parameters():
                 if p.requires_grad and n in saved:
                     p.data.copy_(saved[n])
         else:
-            val_acc, val_loss = run_val(epoch)
+            val_acc, val_loss, tail_mean_acc, macro_f1 = run_val(epoch)
+        if use_cosine_classifier and epoch == center_update_epoch and model_type == "baseline":
+            if not hasattr(model, "cosine_head"):
+                with torch.no_grad():
+                    dummy = torch.zeros(
+                        1, 3, progressive_image_size, progressive_image_size, device=device
+                    )
+                    feat_dim = model.get_features(dummy).shape[1]
+                model.cosine_head = CosineClassifier(feat_dim, 61).to(device)
+                # Flag removed to avoid assigning non-Tensor/Module attribute; use presence of cosine_head instead
+                print(f"[Phase] Cosine classifier activated @ epoch {epoch} (feat_dim={feat_dim})")
+        if use_center_loss and epoch == center_update_epoch and model_type == "baseline":
+            if not hasattr(model, "center_loss_mod"):
+                with torch.no_grad():
+                    dummy = torch.zeros(
+                        1, 3, progressive_image_size, progressive_image_size, device=device
+                    )
+                    feat_dim = model.get_features(dummy).shape[1]
+                model.center_loss_mod = CenterLoss(61, feat_dim).to(device)
+                # Flag removed; presence of center_loss_mod implies activation
+                print(f"[Phase] CenterLoss activated @ epoch {epoch} (weight={center_loss_weight})")
         if val_acc > best_acc:
             best_acc = val_acc
             torch.save(
@@ -231,10 +411,14 @@ def custom_train_loop(
                     "train_acc": train_acc,
                     "val_loss": val_loss,
                     "val_acc": val_acc,
+                    "tail_mean_acc": tail_mean_acc,
+                    "macro_f1": macro_f1,
                 },
                 Path(save_dir) / "best_custom.pth",
             )
-            print(f"  ✅ New best (custom loop) val acc: {best_acc:.2f}%")
+            print(
+                f"  ✅ New best (custom loop) val acc: {best_acc:.2f}% | TailAcc {tail_mean_acc:.2f}% | MacroF1 {macro_f1:.3f}"
+            )
     print(f"\nCustom training finished. Best Val Acc: {best_acc:.2f}%")
 
 
@@ -297,8 +481,49 @@ def parse_args():
         "--model-type",
         type=str,
         default="baseline",
-        choices=["baseline", "multitask"],
-        help="Model type",
+        choices=["baseline", "multitask", "fewshot"],
+        help="Model type ('fewshot' freezes backbone and trains lightweight head)",
+    )
+    parser.add_argument(
+        "--progressive-resize",
+        action="store_true",
+        help="Enable progressive image size increase during training (improves later fine-grained accuracy)",
+    )
+    parser.add_argument(
+        "--progressive-sizes",
+        type=str,
+        default="224,256",
+        help="Comma-separated target sizes to switch to (start uses initial --image-size)",
+    )
+    parser.add_argument(
+        "--resize-epochs",
+        type=str,
+        default="10",
+        help="Comma-separated epochs at which to switch to next size (len must match progressive-sizes minus 1)",
+    )
+    parser.add_argument(
+        "--sampler-switch-epoch",
+        type=int,
+        default=15,
+        help="Epoch at which to disable balanced sampler and revert to standard shuffle",
+    )
+    parser.add_argument(
+        "--focal-start-epoch",
+        type=int,
+        default=20,
+        help="Epoch to switch from CE to Focal loss for hard classes",
+    )
+    parser.add_argument(
+        "--focal-gamma",
+        type=float,
+        default=1.5,
+        help="Gamma value for focal loss after switch",
+    )
+    parser.add_argument(
+        "--smooth-reduce-epoch",
+        type=int,
+        default=12,
+        help="Epoch to reduce label smoothing (e.g. 0.05 -> 0.02) for sharper decision boundaries",
     )
     parser.add_argument(
         "--backbone",
@@ -475,6 +700,130 @@ def parse_args():
         help="EMA decay (0.999 typical, larger = slower updates)",
     )
 
+    # Few-shot specific arguments
+    parser.add_argument(
+        "--fewshot-freeze-backbone",
+        action="store_true",
+        default=True,
+        help="Freeze backbone parameters for few-shot mode",
+    )
+    parser.add_argument(
+        "--fewshot-hidden",
+        type=int,
+        default=512,
+        help="Hidden dim of intermediate FC layer in few-shot classifier",
+    )
+    parser.add_argument(
+        "--fewshot-dropout",
+        type=float,
+        default=0.5,
+        help="Dropout for few-shot classifier",
+    )
+    parser.add_argument(
+        "--fewshot-head-lr-scale",
+        type=float,
+        default=5.0,
+        help="Scale factor applied to base LR for few-shot classifier params",
+    )
+
+    # Phase scheduling arguments (Stage 2/3 fine-tune, loss & augmentation transitions)
+    parser.add_argument(
+        "--stage2-epoch", type=int, default=10, help="Epoch to start Stage 2 partial fine-tune"
+    )
+    parser.add_argument(
+        "--stage3-epoch",
+        type=int,
+        default=20,
+        help="Epoch to start Stage 3 full backbone fine-tune",
+    )
+    parser.add_argument(
+        "--smoothing-decay-epoch1", type=int, default=12, help="Epoch to reduce label smoothing"
+    )
+    parser.add_argument(
+        "--smoothing-decay-epoch2", type=int, default=18, help="Epoch to set label smoothing to 0"
+    )
+    parser.add_argument(
+        "--disable-sampler-epoch",
+        type=int,
+        default=15,
+        help="Epoch to disable weighted sampler (switch to shuffle)",
+    )
+    parser.add_argument(
+        "--lr-restart-epoch", type=int, default=25, help="Epoch for LR warm restart (minor boost)"
+    )
+    parser.add_argument(
+        "--tail-focal-epoch",
+        type=int,
+        default=18,
+        help="Epoch to enable focal loss for tail classes",
+    )
+    parser.add_argument(
+        "--progressive-resize-epoch",
+        type=int,
+        default=30,
+        help="Epoch to increase input resolution for fine detail",
+    )
+    parser.add_argument(
+        "--progressive-image-size",
+        type=int,
+        default=256,
+        help="Image size after progressive resize phase starts",
+    )
+    parser.add_argument(
+        "--final-clean-epoch",
+        type=int,
+        default=40,
+        help="Epoch to switch to minimal augmentation for final convergence",
+    )
+    # Dynamic regularization decay (Mixup/CutMix)
+    parser.add_argument(
+        "--mixup-decay-epoch1",
+        type=int,
+        default=10,
+        help="Epoch to reduce Mixup alpha (e.g. 0.4 -> 0.2)",
+    )
+    parser.add_argument(
+        "--mixup-decay-epoch2",
+        type=int,
+        default=12,
+        help="Epoch to further reduce Mixup alpha (e.g. 0.2 -> 0.1)",
+    )
+    parser.add_argument(
+        "--mixup-disable-epoch",
+        type=int,
+        default=15,
+        help="Epoch to disable Mixup (alpha -> 0)",
+    )
+    parser.add_argument(
+        "--cutmix-disable-epoch",
+        type=int,
+        default=10,
+        help="Epoch to disable CutMix earlier than Mixup",
+    )
+    # Cosine classifier & CenterLoss for final margin sharpening
+    parser.add_argument(
+        "--use-cosine-classifier",
+        action="store_true",
+        help="Replace linear head with cosine classifier in final phase",
+    )
+    parser.add_argument(
+        "--use-center-loss",
+        action="store_true",
+        help="Enable CenterLoss in final convergence stage",
+    )
+    parser.add_argument(
+        "--center-loss-weight",
+        type=float,
+        default=0.01,
+        help="Weight for CenterLoss term",
+    )
+    parser.add_argument(
+        "--center-update-epoch",
+        type=int,
+        default=35,
+        help="Epoch to enable cosine classifier / center loss adaptations",
+    )
+
     args = parser.parse_args()
     return args
 
@@ -584,17 +933,50 @@ def main():
 
     # Create model
     print("\nCreating model...")
-    model = create_model(
-        model_type=args.model_type,
-        backbone=args.backbone,
-        pretrained=args.pretrained,
-        dropout=args.dropout,
-        num_classes=61,
-    )
-    # Type safety assertion
-    assert isinstance(model, nn.Module), "create_model must return nn.Module"
-    model = model.to(device)
-    # Preserve an uncompiled reference for EMA / Trainer (raw_model) before any optional compilation
+
+    # Parse progressive resize schedule
+    progressive_resize_enabled = args.progressive_resize
+    if progressive_resize_enabled:
+        target_sizes = [int(s) for s in args.progressive_sizes.split(",") if s.strip()]
+        resize_epochs = [int(e) for e in args.resize_epochs.split(",") if e.strip()]
+        if len(target_sizes) < 2 or len(resize_epochs) != len(target_sizes) - 1:
+            raise ValueError("Progressive resize configuration invalid: sizes or epochs mismatch")
+        print(f"Progressive resize enabled: sizes={target_sizes}, switch_epochs={resize_epochs}")
+    if args.model_type == "fewshot":
+        # Build a pretrained baseline backbone first
+        print("Initializing baseline backbone for few-shot adaptation...")
+        backbone_model = create_model(
+            model_type="baseline",
+            backbone=args.backbone,
+            pretrained=args.pretrained,
+            dropout=args.dropout,
+            num_classes=61,
+        )
+        backbone_model = backbone_model.to(device)
+        # Wrap with FewShotModel
+        print("Wrapping backbone with FewShotModel head...")
+        model = create_model(
+            model_type="fewshot",
+            backbone=args.backbone,
+            pretrained=False,  # already loaded
+            pretrained_model=backbone_model,
+            num_classes=61,
+            freeze_backbone=args.fewshot_freeze_backbone
+            if hasattr(args, "fewshot_freeze_backbone")
+            else True,
+        )
+        model = model.to(device)
+        # Adjust optimizer later: head gets higher LR
+    else:
+        model = create_model(
+            model_type=args.model_type,
+            backbone=args.backbone,
+            pretrained=args.pretrained,
+            dropout=args.dropout,
+            num_classes=61,
+        )
+        model = model.to(device)
+    # Preserve reference for training
     raw_model = model
 
     # Optimize memory layout for better performance (CUDA only - MPS has issues)
@@ -617,26 +999,64 @@ def main():
 
     # Create optimizer
     print("\nCreating optimizer...")
-    if args.optimizer == "adam":
-        optimizer = torch.optim.Adam(
-            model.parameters(),
-            lr=args.lr,
-            weight_decay=args.weight_decay,
-        )
-    elif args.optimizer == "adamw":
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=args.lr,
-            weight_decay=args.weight_decay,
-        )
-    else:  # sgd
-        optimizer = torch.optim.SGD(
-            model.parameters(),
-            lr=args.lr,
-            momentum=0.9,
-            weight_decay=args.weight_decay,
-        )
-    print(f"Optimizer: {args.optimizer}")
+    # Save initial label smoothing to allow mid-training reduction
+    initial_label_smoothing = args.label_smoothing
+    reduced_label_smoothing = 0.02 if initial_label_smoothing > 0.02 else initial_label_smoothing
+    if args.model_type == "fewshot":
+        # Scale LR for few-shot classifier head with safe getattr fallback
+        base_lr = args.lr
+        head_lr = base_lr * args.fewshot_head_lr_scale
+        head_module = getattr(model, "classifier", None)
+        if head_module is not None and hasattr(head_module, "parameters"):
+            head_params = [p for p in head_module.parameters() if p.requires_grad]
+            param_groups = [{"params": head_params, "lr": head_lr}]
+            head_lr_display = head_lr
+        else:
+            # Fallback: no distinct classifier module; use all trainable params
+            fallback_params = [p for p in model.parameters() if p.requires_grad]
+            param_groups = [{"params": fallback_params, "lr": head_lr}]
+            head_lr_display = head_lr
+        if args.optimizer == "adam":
+            optimizer = torch.optim.Adam(
+                param_groups,
+                lr=base_lr,
+                weight_decay=args.weight_decay,
+            )
+        elif args.optimizer == "adamw":
+            optimizer = torch.optim.AdamW(
+                param_groups,
+                lr=base_lr,
+                weight_decay=args.weight_decay,
+            )
+        else:  # sgd
+            optimizer = torch.optim.SGD(
+                param_groups,
+                lr=base_lr,
+                momentum=0.9,
+                weight_decay=args.weight_decay,
+            )
+    else:
+        if args.optimizer == "adam":
+            optimizer = torch.optim.Adam(
+                model.parameters(),
+                lr=args.lr,
+                weight_decay=args.weight_decay,
+            )
+        elif args.optimizer == "adamw":
+            optimizer = torch.optim.AdamW(
+                model.parameters(),
+                lr=args.lr,
+                weight_decay=args.weight_decay,
+            )
+        else:  # sgd
+            optimizer = torch.optim.SGD(
+                model.parameters(),
+                lr=args.lr,
+                momentum=0.9,
+                weight_decay=args.weight_decay,
+            )
+        head_lr_display = args.lr
+    print(f"Optimizer: {args.optimizer} (effective head lr={head_lr_display:.6f})")
 
     # Create scheduler with warmup
     # Good taste: warmup prevents pretrained model from destroying learned features
@@ -732,6 +1152,20 @@ def main():
             cutmix_prob=args.cutmix_prob,
             save_dir=args.save_dir,
             ema=ema_obj,
+            stage2_epoch=args.stage2_epoch,
+            stage3_epoch=args.stage3_epoch,
+            smoothing_decay_epoch1=args.smoothing_decay_epoch1,
+            smoothing_decay_epoch2=args.smoothing_decay_epoch2,
+            disable_sampler_epoch=args.disable_sampler_epoch,
+            lr_restart_epoch=args.lr_restart_epoch,
+            tail_focal_epoch=args.tail_focal_epoch,
+            progressive_resize_epoch=args.progressive_resize_epoch,
+            progressive_image_size=args.progressive_image_size,
+            final_clean_epoch=args.final_clean_epoch,
+            mixup_decay_epoch1=args.mixup_decay_epoch1,
+            mixup_decay_epoch2=args.mixup_decay_epoch2,
+            mixup_disable_epoch=args.mixup_disable_epoch,
+            cutmix_disable_epoch=args.cutmix_disable_epoch,
         )
         print("\nCustom loop finished. Skipping Trainer.train().")
     else:
