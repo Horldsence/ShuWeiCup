@@ -49,6 +49,7 @@ Few-shot Metadata:
 """
 
 import argparse
+import contextlib
 import math
 import os
 import random
@@ -61,6 +62,10 @@ import timm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+os.environ.setdefault(
+    "ALBUMENTATIONS_DISABLE_VERSION_CHECK", "1"
+)  # Suppress albumentations version check warning
 from albumentations import ColorJitter, Compose, HorizontalFlip, Normalize, Resize
 from albumentations.pytorch import ToTensorV2
 from torch.optim import SGD, AdamW
@@ -237,11 +242,9 @@ class FewShotArcFaceModel(nn.Module):
         for p in self.backbone.parameters():
             p.requires_grad = False
 
-        if partial_unfreeze:
-            # Unfreeze last two stages for ResNet-like architectures
-            for name, p in self.backbone.named_parameters():
-                if "layer3" in name or "layer4" in name:
-                    p.requires_grad = True
+        # Start fully frozen. Delayed selective unfreeze (layer4 only) handled in training loop.
+        # This avoids early overfitting and reduces initial trainable parameter count.
+        # (Strategy F: only unfreeze layer4 later.)
 
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         total = sum(p.numel() for p in self.parameters())
@@ -330,7 +333,11 @@ def train_one_epoch(
     total_correct = 0
     total_samples = 0
 
-    scaler = torch.cuda.amp.GradScaler(enabled=(amp and device.type == "cuda"))
+    # AMP scaler only for CUDA; for MPS/CPU we fall back to normal precision
+    use_amp = amp and device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
+    # (Removed legacy instantiation; handled above)
 
     use_mixup = mixup_alpha > 0 and epoch < mixup_disable_epoch
 
@@ -342,7 +349,10 @@ def train_one_epoch(
         images_aug, y_a, y_b, lam = apply_mixup(images, labels, mixup_alpha if use_mixup else 0.0)
 
         optimizer.zero_grad(set_to_none=True)
-        with torch.cuda.amp.autocast(enabled=(amp and device.type == "cuda")):
+        autocast_ctx = (
+            torch.cuda.amp.autocast(enabled=use_amp) if use_amp else contextlib.nullcontext()
+        )
+        with autocast_ctx:
             logits, feats = model(images_aug, labels=y_a)  # margin applied on y_a
             ce_a = ce_loss_fn(logits, y_a)
             if use_mixup:
@@ -358,10 +368,15 @@ def train_one_epoch(
             ploss = proto_loss_fn(feats_used, y_a, prototypes)
             loss = ce_loss + proto_weight * ploss
 
-        scaler.scale(loss).backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        scaler.step(optimizer)
-        scaler.update()
+        if use_amp:
+            scaler.scale(loss).backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
         if scheduler:
             scheduler.step()
 
@@ -447,32 +462,54 @@ def parse_args():
     # Model
     p.add_argument("--backbone", type=str, default="resnet50", help="Backbone architecture (timm)")
     p.add_argument("--pretrained", action="store_true", default=True, help="Use pretrained weights")
-    p.add_argument("--dropout", type=float, default=0.1, help="Dropout before head")
+    p.add_argument("--dropout", type=float, default=0.3, help="Dropout before head (Strategy B)")
     p.add_argument(
         "--freeze-stage12", action="store_true", help="Freeze layers 1&2 only (partial unfreeze)"
     )
-    # Training
+    # Training hyperparameters
     p.add_argument("--epochs", type=int, default=40)
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--lr", type=float, default=3e-4, help="Base backbone LR")
-    p.add_argument("--head-lr-scale", type=float, default=5.0, help="Scale factor for head LR")
-    p.add_argument("--proto-weight", type=float, default=0.5, help="Weight for PrototypeLoss")
+    p.add_argument(
+        "--head-lr-scale", type=float, default=3.0, help="Scale factor for head LR (Strategy A)"
+    )
+    p.add_argument(
+        "--proto-weight", type=float, default=0.4, help="Weight for PrototypeLoss (Strategy E)"
+    )
     p.add_argument("--arcface-margin", type=float, default=0.30)
     p.add_argument("--arcface-scale", type=float, default=30.0)
     p.add_argument("--image-size", type=int, default=256)
     p.add_argument("--mixup-alpha", type=float, default=0.2, help="Mixup alpha (0 disables)")
-    p.add_argument("--mixup-disable-epoch", type=int, default=5, help="Epoch to disable Mixup")
+    p.add_argument(
+        "--mixup-disable-epoch", type=int, default=8, help="Epoch to disable Mixup (Strategy C)"
+    )
     p.add_argument("--no-mixup", action="store_true", help="Force disable Mixup from start")
     p.add_argument(
         "--amp", action="store_true", default=True, help="Use mixed precision (CUDA only)"
     )
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--label-smoothing", type=float, default=0.05, help="Label smoothing for CE (Strategy D)"
+    )
+    p.add_argument(
+        "--proto-ema", type=float, default=0.7, help="EMA momentum for prototypes (0 disables EMA)"
+    )
+    p.add_argument(
+        "--proto-refresh-interval",
+        type=int,
+        default=1,
+        help="Epoch interval to recompute raw prototypes before EMA blend",
+    )
+    p.add_argument(
+        "--unfreeze-epoch", type=int, default=3, help="Epoch to unfreeze layer4 (Strategy F)"
+    )
+    # Saving / early stop
     p.add_argument("--save-dir", type=str, default="checkpoints/task2_fewshot")
     p.add_argument("--save-best-only", action="store_true", default=True)
     p.add_argument(
         "--early-stop-patience", type=int, default=10, help="Early stop patience (val acc plateau)"
     )
-    # Optimizer choice
+    # Optimizer
     p.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "sgd"])
     return p.parse_args()
 
@@ -484,7 +521,12 @@ def main():
     args = parse_args()
     set_seed(args.seed)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     print(f"[Device] {device}")
 
     # Create save directory
@@ -512,11 +554,14 @@ def main():
     print(f"[Data] Few-shot train samples: {len(train_dataset)}")
     print(f"[Data] Validation samples: {len(val_dataset)}")
 
+    adaptive_workers = (
+        2 if device.type == "cuda" else 0
+    )  # Reduce multiprocessing on MPS/CPU to avoid kill signals
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=2,
+        num_workers=adaptive_workers,
         pin_memory=(device.type == "cuda"),
         collate_fn=fewshot_collate,
     )
@@ -524,7 +569,7 @@ def main():
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=2,
+        num_workers=adaptive_workers,
         pin_memory=(device.type == "cuda"),
         collate_fn=fewshot_collate,
     )
@@ -569,11 +614,13 @@ def main():
         anneal_strategy="cos",
     )
 
-    ce_loss_fn = nn.CrossEntropyLoss()
+    ce_loss_fn = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
     proto_loss_fn = PrototypeLoss()
 
-    # Initial prototypes
-    prototypes = compute_prototypes(model, train_loader, device)
+    # Initial prototypes (raw) + set EMA state
+    raw_prototypes = compute_prototypes(model, train_loader, device)
+    prototypes = raw_prototypes
+    prev_prototypes = raw_prototypes.clone()
     print("[Proto] Initialized prototypes.")
 
     best_val_acc = 0.0
@@ -604,8 +651,23 @@ def main():
     for epoch in range(args.epochs):
         print(f"\nEpoch {epoch}/{args.epochs}")
 
-        # Refresh prototypes every epoch (cheap: few-shot)
-        prototypes = compute_prototypes(model, train_loader, device)
+        # Prototype refresh + EMA (interval-based)
+        if epoch % args.proto_refresh_interval == 0:
+            raw_prototypes = compute_prototypes(model, train_loader, device)
+            if 0.0 <= args.proto_ema < 1.0:
+                prototypes = (
+                    args.proto_ema * prev_prototypes + (1 - args.proto_ema) * raw_prototypes
+                )
+            else:
+                prototypes = raw_prototypes
+            prev_prototypes = prototypes.clone()
+
+        # Delayed selective unfreeze (Strategy F)
+        if args.unfreeze_epoch == epoch:
+            print(f"[Unfreeze] Epoch {epoch}: enabling layer4 parameters for training.")
+            for name, p in model.backbone.named_parameters():
+                if "layer4" in name:
+                    p.requires_grad = True
 
         train_metrics = train_one_epoch(
             model=model,
