@@ -7,10 +7,7 @@ Model Evaluation Tool
 
 Automatically evaluate PT model on dataset with known labels.
 No bullshit. No over-engineering. Just load, infer, compare, report.
-
-Usage:
-    python evaluate.py --model best.pth --data data/cleaned/train
-    python evaluate.py --model best.pth --data data/cleaned/val --model-type multitask
+Usage: python evaluate.py --model best.pth --data data/cleaned/train python evaluate.py --model best.pth --data data/cleaned/val --model-type multitask
 """
 
 import argparse
@@ -19,6 +16,7 @@ import random
 import sys
 import time
 from pathlib import Path
+
 from typing import Dict, List, Optional, Tuple
 
 import cv2
