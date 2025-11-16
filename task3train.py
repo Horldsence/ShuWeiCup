@@ -100,6 +100,7 @@ try:
     from pytorch_grad_cam.utils.image import show_cam_on_image
 except ImportError:
     GradCAM = None  # 延迟检查
+    show_cam_on_image = None
 
 
 # -----------------------------
@@ -167,7 +168,9 @@ class SeverityDataset(Dataset):
             return A.Compose(
                 [
                     A.Resize(self.image_size, self.image_size),
-                    A.RandomResizedCrop(self.image_size, self.image_size, scale=(0.85, 1.0), p=0.7),
+                    A.RandomResizedCrop(
+                        size=(self.image_size, self.image_size), scale=(0.85, 1.0), p=0.7
+                    ),
                     A.HorizontalFlip(p=0.5),
                     A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.08, rotate_limit=25, p=0.5),
                     A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05, p=0.6),
@@ -274,11 +277,18 @@ def compute_metrics(all_targets: List[int], all_preds: List[int]) -> Dict:
         labels=[0, 1, 2, 3],
         target_names=["Healthy", "Mild", "Moderate", "Severe"],
         output_dict=True,
-        zero_division=0,
+        zero_division="warn",
     )
-    per_class_recall = {
-        k: v["recall"] for k, v in report.items() if k in ["Healthy", "Mild", "Moderate", "Severe"]
-    }
+    # Guard: ensure dict (some environments may return str unexpectedly)
+    if isinstance(report, dict):
+        per_class_recall = {
+            k: v["recall"]
+            for k, v in report.items()
+            if k in ["Healthy", "Mild", "Moderate", "Severe"]
+        }
+    else:
+        print("Warning: classification_report returned non-dict; per_class_recall empty.")
+        per_class_recall = {c: 0.0 for c in ["Healthy", "Mild", "Moderate", "Severe"]}
 
     cm = confusion_matrix(all_targets, all_preds, labels=[0, 1, 2, 3])
     return {
@@ -299,7 +309,9 @@ def plot_confusion_matrix(cm: List[List[int]], class_names: List[str], save_path
     ax.set_yticklabels(class_names)
     for i in range(len(class_names)):
         for j in range(len(class_names)):
-            ax.text(j, i, int(cm_arr[i, j]), ha="center", va="center", color="black", fontsize=10)
+            ax.text(
+                j, i, str(int(cm_arr[i, j])), ha="center", va="center", color="black", fontsize=10
+            )
     ax.set_xlabel("Predicted")
     ax.set_ylabel("True")
     ax.set_title("Confusion Matrix")
@@ -517,7 +529,7 @@ def run_gradcam(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     target_layer = model.get_last_conv_layer()
-    cam = GradCAM(model=model, target_layers=[target_layer], use_cuda=device.type == "cuda")
+    cam = GradCAM(model=model, target_layers=[target_layer])
 
     saved = 0
     for images, labels, names in loader:
@@ -535,10 +547,13 @@ def run_gradcam(
             img_np = (img_tensor * std + mean).clamp(0, 1).permute(1, 2, 0).numpy()
 
             # 生成 CAM
-            grayscale_cam = cam(input_tensor=images[i].unsqueeze(0), targets=None)[0]
-            visualization = show_cam_on_image(
-                img_np, grayscale_cam, use_rgb=True, image_weight=0.55
-            )
+            grayscale_cam = cam(input_tensor=images[i].unsqueeze(0))[0]
+            if callable(show_cam_on_image):
+                visualization = show_cam_on_image(
+                    img_np, grayscale_cam, use_rgb=True, image_weight=0.55
+                )
+            else:
+                visualization = (img_np * 255).astype(np.uint8)
 
             correct = preds[i].item() == labels[i].item()
             filename = (
@@ -836,9 +851,12 @@ def main():
             labels=[0, 1, 2, 3],
             target_names=["Healthy", "Mild", "Moderate", "Severe"],
             output_dict=True,
-            zero_division=0,
+            zero_division="warn",
         )
-        save_classification_report(report_dic, out_dir / "classification_report.csv")
+        if isinstance(report_dic, dict):
+            save_classification_report(report_dic, out_dir / "classification_report.csv")
+        else:
+            print("Warning: classification_report returned non-dict; skip CSV export.")
     else:
         print("No confusion matrix in best_metrics; skipping plots.")
 
