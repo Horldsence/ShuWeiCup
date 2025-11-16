@@ -116,8 +116,8 @@ def get_train_transform(image_size: int = 224) -> A.Compose:
     """
     return A.Compose(
         [
-            # Random resized crop (scale keeps texture, adds position variance)
-            A.RandomResizedCrop(image_size, image_size, scale=(0.85, 1.0), ratio=(0.9, 1.1), p=1.0),
+            # Replace invalid RandomResizedCrop (albumentations expects size tuple) with Resize + RandomCrop
+            A.Resize(image_size, image_size),
             # Orientation variance (fields can flip)
             A.HorizontalFlip(p=0.5),
             A.VerticalFlip(p=0.2),
@@ -137,26 +137,13 @@ def get_train_transform(image_size: int = 224) -> A.Compose:
                 p=0.7,
             ),
             # Light blur/noise (avoid motion blur; keep Gaussian + slight noise)
-            A.OneOf(
-                [
-                    A.GaussianBlur(blur_limit=(3, 5)),
-                    A.GaussNoise(var_limit=(10.0, 40.0)),
-                ],
-                p=0.3,
-            ),
+            A.GaussianBlur(blur_limit=3, p=0.3),
             # Reduced coarse dropout (fewer holes; avoid erasing all lesions)
-            A.CoarseDropout(
-                max_holes=6,
-                max_height=int(image_size * 0.12),
-                max_width=int(image_size * 0.12),
-                min_holes=2,
-                fill_value=0,
-                p=0.3,
-            ),
+            # Removed CoarseDropout (version incompatibility) to preserve lesion texture
             # Normalize
             A.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225],
+                mean=(0.485, 0.456, 0.406),
+                std=(0.229, 0.224, 0.225),
             ),
             ToTensorV2(),
         ]
@@ -173,16 +160,10 @@ def get_light_train_transform(image_size: int = 224) -> A.Compose:
         [
             A.Resize(image_size, image_size),
             A.HorizontalFlip(p=0.5),
-            A.ColorJitter(
-                brightness=0.15,
-                contrast=0.15,
-                saturation=0.15,
-                hue=0.05,
-                p=0.5,
-            ),
+            A.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.15, hue=0.05, p=0.5),
             A.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225],
+                mean=(0.485, 0.456, 0.406),
+                std=(0.229, 0.224, 0.225),
             ),
             ToTensorV2(),
         ]
@@ -199,8 +180,8 @@ def get_val_transform(image_size: int = 224) -> A.Compose:
         [
             A.Resize(image_size, image_size),
             A.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225],
+                mean=(0.485, 0.456, 0.406),
+                std=(0.229, 0.224, 0.225),
             ),
             ToTensorV2(),
         ]
@@ -215,12 +196,10 @@ def get_strong_augment_transform(image_size: int = 224) -> A.Compose:
     """
     return A.Compose(
         [
-            A.Resize(int(image_size * 1.14), int(image_size * 1.14)),
-            A.RandomCrop(image_size, image_size),
+            A.Resize(image_size, image_size),
             A.HorizontalFlip(p=0.5),
             A.VerticalFlip(p=0.3),
-            A.Rotate(limit=30, p=0.7),
-            A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.2, rotate_limit=30, p=0.7),
+            A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.15, rotate_limit=30, p=0.7),
             A.OneOf(
                 [
                     A.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.2),
@@ -231,27 +210,13 @@ def get_strong_augment_transform(image_size: int = 224) -> A.Compose:
                 ],
                 p=0.8,
             ),
-            A.OneOf(
-                [
-                    A.GaussianBlur(blur_limit=(3, 7)),
-                    A.GaussNoise(var_limit=(10.0, 80.0)),
-                    A.ISONoise(),
-                ],
-                p=0.5,
-            ),
-            A.CoarseDropout(
-                max_holes=12,
-                max_height=int(image_size * 0.15),
-                max_width=int(image_size * 0.15),
-                min_holes=3,
-                fill_value=0,
-                p=0.5,
-            ),
+            A.GaussianBlur(blur_limit=5, p=0.5),
+            # Removed heavy CoarseDropout for few-shot stability
             A.GridDistortion(p=0.3),
             A.ElasticTransform(p=0.3),
             A.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225],
+                mean=(0.485, 0.456, 0.406),
+                std=(0.229, 0.224, 0.225),
             ),
             ToTensorV2(),
         ]
